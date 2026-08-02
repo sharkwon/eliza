@@ -226,6 +226,55 @@ describe("registerClientChatSendHandler — delivery", () => {
     expect(created).toHaveLength(0);
     expect(broadcastWs).not.toHaveBeenCalled();
   });
+
+  it("keeps a relay source routable even when connector discovery is broken", async () => {
+    const { runtime, created } = makeRuntime();
+    const { state, broadcastWs } = makeState([conv("c1", "room-1")]);
+    registerClientChatSendHandler(runtime as unknown as IAgentRuntime, state);
+    // The connector registry is broken: discovery now throws. Relay sources
+    // short-circuit before discovery (RELAY_SOURCES), so client_chat must
+    // still deliver through its registered internal send handler.
+    runtime.getMessageConnectors = () => {
+      throw new Error("connector registry broken");
+    };
+
+    await expect(
+      runtime.sendMessageToTarget(
+        { source: "client_chat", roomId: "room-1" as UUID },
+        { text: "relayed result" },
+      ),
+    ).resolves.toMatchObject({
+      roomId: "room-1",
+      content: { text: "relayed result", source: "client_chat" },
+    });
+
+    expect(created).toHaveLength(1);
+    expect(broadcastWs).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces connector discovery failure instead of routing through the dashboard fallback", async () => {
+    const { runtime, created } = makeRuntime();
+    const { state, broadcastWs } = makeState([conv("c1", "room-1")]);
+    registerClientChatSendHandler(runtime as unknown as IAgentRuntime, state);
+    // Break the registry AFTER wiring: an unknown dashboard-origin source now
+    // hits a throwing discovery. The wrapper must NOT translate that into "no
+    // connector" and silently fall back to the dashboard surface — the failure
+    // has to be observable by the caller (fail-fast, error-policy contract).
+    runtime.getMessageConnectors = () => {
+      throw new Error("connector registry broken");
+    };
+
+    await expect(
+      runtime.sendMessageToTarget(
+        { source: "my_custom_source", roomId: "room-1" as UUID },
+        { text: "relayed result" },
+      ),
+    ).rejects.toThrow("connector registry broken");
+
+    // The dashboard fallback deliver path must NOT have run.
+    expect(created).toHaveLength(0);
+    expect(broadcastWs).not.toHaveBeenCalled();
+  });
 });
 
 describe("swarm synthesis — dashboard transport ownership", () => {
