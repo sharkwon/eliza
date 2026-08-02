@@ -476,7 +476,7 @@ jobs:
     env:
       TEST_LANE: "pr"
       ELIZA_LIVE_TEST: "0"
-      SCENARIO_USE_LLM_PROXY: "1"
+      SCENARIO_USE_DETERMINISTIC_MODEL: "1"
       CEREBRAS_API_KEY: ""
       OPENAI_API_KEY: ""
       ANTHROPIC_API_KEY: ""
@@ -514,9 +514,8 @@ jobs:
       - name: Scenario runner unit coverage
         run: bun run --cwd packages/scenario-runner test -- src/executor.test.ts src/runtime-factory.test.ts src/scenario-pr-workflow.test.ts
 
-      - name: Deterministic LLM proxy unit coverage
-        working-directory: packages
-        run: bunx vitest run --config test/mocks/vitest.config.ts test/mocks/__tests__/llm-proxy-plugin.test.ts
+      - name: Deterministic model provider unit coverage
+        run: bun run --cwd packages/core test -- src/testing/deterministic-model-plugin.test.ts
 
       - name: UI voice interaction coverage
         run: bun run --cwd packages/ui test -- src/hooks/useVoiceChat.bidirectional.test.tsx src/hooks/useContinuousChat.test.tsx
@@ -536,7 +535,7 @@ jobs:
     env:
       TEST_LANE: "pr"
       ELIZA_LIVE_TEST: "0"
-      SCENARIO_USE_LLM_PROXY: "1"
+      SCENARIO_USE_DETERMINISTIC_MODEL: "1"
       CEREBRAS_API_KEY: ""
       OPENAI_API_KEY: ""
       ANTHROPIC_API_KEY: ""
@@ -611,7 +610,7 @@ jobs:
     env:
       TEST_LANE: "pr"
       ELIZA_LIVE_TEST: "0"
-      SCENARIO_USE_LLM_PROXY: "1"
+      SCENARIO_USE_DETERMINISTIC_MODEL: "1"
       CEREBRAS_API_KEY: ""
       OPENAI_API_KEY: ""
       ANTHROPIC_API_KEY: ""
@@ -673,7 +672,7 @@ jobs:
     env:
       TEST_LANE: "pr"
       ELIZA_LIVE_TEST: "0"
-      SCENARIO_USE_LLM_PROXY: "1"
+      SCENARIO_USE_DETERMINISTIC_MODEL: "1"
       CEREBRAS_API_KEY: ""
       OPENAI_API_KEY: ""
       ANTHROPIC_API_KEY: ""
@@ -747,7 +746,7 @@ jobs:
     env:
       TEST_LANE: "pr"
       ELIZA_LIVE_TEST: "0"
-      SCENARIO_USE_LLM_PROXY: "1"
+      SCENARIO_USE_DETERMINISTIC_MODEL: "1"
       CEREBRAS_API_KEY: ""
       OPENAI_API_KEY: ""
       ANTHROPIC_API_KEY: ""
@@ -779,14 +778,13 @@ jobs:
       - name: Ensure generated shared i18n data
         run: node packages/app-core/scripts/ensure-shared-i18n-data.mjs
 
-      - name: Keyless harness e2e (mock-LLM + recorded fixtures)
-        working-directory: packages
-        run: bunx vitest run --config test/mocks/vitest.config.ts test/mocks/__tests__/
+      - name: External API mock contract coverage
+        run: bun run --cwd packages/scenario-runner test -- test/mocks/__tests__/
 
       - name: Per-plugin keyless harness adoption proofs
         run: |
-          bun run --cwd plugins/plugin-anthropic test:harness
-          bun run --cwd plugins/plugin-discord test:harness
+          bun run --cwd plugins/plugin-anthropic test:real-runtime
+          bun run --cwd plugins/plugin-discord test:real-runtime
 
   zero-key-e2e:
     name: Zero-Key Deterministic E2E
