@@ -896,12 +896,12 @@ const SNAPSHOT_HTTP_ERROR_SHAPE =
  * Two shapes qualify:
  *
  * - UNDECRYPTABLE: the AEAD auth tag fails to verify (corruption / wrong key /
- *   wrong AAD, surfaced by `@elizaos/security` as `AeadError`) or the KMS key
+ *   wrong AAD, surfaced by the core KMS as `AeadError`) or the KMS key
  *   version that encrypted it no longer exists (`KeyNotFoundError` — thrown
  *   only by the ephemeral `memory` KMS backend, which derives a fresh
  *   per-process key on every restart and thus orphans everything it previously
  *   encrypted). Matched by error class NAME rather than `instanceof` because
- *   `AeadError` is internal to `@elizaos/security` (not exported) and this code
+ *   `AeadError` is internal to the core KMS submodule (not exported) and this code
  *   runs bundled, where a cross-realm `instanceof` on a dependency's error
  *   class is unreliable.
  * - UNRETRIEVABLE / UNRESTORABLE: the snapshot fetch or restore push was
@@ -2566,8 +2566,18 @@ export class ElizaSandboxService {
               // chain is intact, only too large — booting empty would silently
               // drop every byte of it. The one consent path is wake's
               // forceFreshBoot.
-              throw new Error(
+              throw new ElizaError(
                 `Restore refused: ${error.message}. Booting empty would discard this agent's state; wake with forceFreshBoot to explicitly accept the data loss.`,
+                {
+                  code: "SNAPSHOT_RESTORE_REQUIRES_FRESH_BOOT_CONSENT",
+                  cause: error,
+                  context: {
+                    agentId: rec.id,
+                    payloadBytes: error.payloadBytes,
+                    limitBytes: error.limitBytes,
+                  },
+                  severity: "fatal",
+                },
               );
             }
             if (restoreOverride?.kind === "from-backup") throw error;
@@ -2603,8 +2613,18 @@ export class ElizaSandboxService {
               // Ordered before the from-backup rethrow for the same reason as
               // the fetch branch: a gated wake would otherwise never see the
               // consent sentence.
-              throw new Error(
+              throw new ElizaError(
                 `Restore refused: ${error.message}. Booting empty would discard this agent's state; wake with forceFreshBoot to explicitly accept the data loss.`,
+                {
+                  code: "SNAPSHOT_RESTORE_REQUIRES_FRESH_BOOT_CONSENT",
+                  cause: error,
+                  context: {
+                    agentId: rec.id,
+                    payloadBytes: error.payloadBytes,
+                    limitBytes: error.limitBytes,
+                  },
+                  severity: "fatal",
+                },
               );
             } else if (restoreOverride?.kind === "from-backup") {
               // Same no-silent-fresh-boot rule as the fetch above: an explicit
@@ -3159,7 +3179,12 @@ export class ElizaSandboxService {
       history.length > SHARED_RUNTIME_HISTORY_MAX_MESSAGES
         ? history.slice(history.length - SHARED_RUNTIME_HISTORY_MAX_MESSAGES)
         : history;
-    await sharedRuntimeHistoryRepository.upsert(agentId, channelId, capped);
+    await sharedRuntimeHistoryRepository.merge(
+      agentId,
+      channelId,
+      capped,
+      SHARED_RUNTIME_HISTORY_MAX_MESSAGES,
+    );
   }
 
   private sharedRuntimeBillingPrompt(
@@ -6873,6 +6898,8 @@ export class ElizaSandboxService {
       try {
         preShutdownSnapshot = await this.fetchSnapshotState(snapshotSource);
       } catch (error) {
+        // error-policy:J1 the shutdown command boundary translates capture
+        // failures into an explicit refusal while leaving the agent running.
         const message = error instanceof Error ? error.message : String(error);
         if (message === SNAPSHOT_ENDPOINT_UNSUPPORTED) {
           // The deployed image cannot snapshot by construction; requiring a
@@ -9784,7 +9811,13 @@ export class ElizaSandboxService {
       normalized.includes("not found") ||
       normalized.includes("already gone") ||
       normalized.includes("no longer exists") ||
-      normalized.includes("404")
+      normalized.includes("404") ||
+      // docker-sandbox-provider's hydrateContainerFromDb throws this when the
+      // sandbox row points at a node purged from docker_nodes (decommissioned
+      // node). For stop/delete teardown the container's host no longer exists,
+      // so there is nothing left to stop — without this the delete escalates,
+      // exhausts retries, and wedges the agent in deletion_failed forever.
+      normalized.includes("missing persisted docker node metadata")
     );
   }
 
