@@ -11,8 +11,8 @@ import "./web-ws-base-fix";
  * view importers, and resolves cloud-only branding from the injected API base
  * / desktop runtime mode.
  *
- * `main()` drives the boot pipeline — embed-iframe session handshake, app-window
- * and model-tester route shortcuts, managed cloud launch connection, the
+ * `main()` drives the boot pipeline — embed-iframe session handshake,
+ * app-window route shortcuts, managed cloud launch connection, the
  * headless iOS full-Bun backend smoke gate, popout and detached/overlay window
  * shells, then the per-platform bridge stack (storage + Capacitor bridges, iOS
  * local-agent fetch/native-request bridges, Android native agent fetch bridge,
@@ -78,12 +78,12 @@ import {
 } from "@elizaos/ui/bridge/storage-bridge";
 import { RenderTelemetryProfiler } from "@elizaos/ui/cloud-ui/runtime/render-telemetry";
 import { AppWindowRenderer } from "@elizaos/ui/components/apps/AppWindowRenderer";
+import { cloudPairTokenKeyForAgent } from "@elizaos/ui/components/auth/CloudPairRelay";
 import { ShellModalityProvider } from "@elizaos/ui/components/ShellModalityProvider";
 import { ShellRoleProvider } from "@elizaos/ui/components/ShellRoleProvider";
 import type {
   BrandingConfig,
   CodingAgentTasksPanelProps,
-  FineTuningViewProps,
 } from "@elizaos/ui/config";
 import {
   type AppBootConfig,
@@ -145,10 +145,12 @@ import {
 } from "@elizaos/ui/platform/window-shell";
 import { AppProvider } from "@elizaos/ui/state";
 import { upsertAndActivateAgentProfile } from "@elizaos/ui/state/agent-profiles";
+import { resolveDedicatedAgentId } from "@elizaos/ui/state/agent-session-recovery";
 import { initOcrBridge } from "@elizaos/ui/state/ocr-bridge";
 import {
   applyUiTheme,
   createPersistedActiveServer,
+  loadPersistedActiveServer,
   loadUiLanguage,
   loadUiThemeMode,
   resolveUiTheme,
@@ -277,13 +279,6 @@ function importAppTaskCoordinatorRegister() {
   );
 }
 
-function importAppTraining() {
-  return cachedDynamicImport(
-    "@elizaos/plugin-training",
-    () => import("@elizaos/plugin-training"),
-  );
-}
-
 function lazyNamedComponent<TProps>(
   load: () => Promise<ComponentType<TProps>>,
 ): ComponentType<TProps> {
@@ -309,10 +304,6 @@ const CodingAgentSettingsSection = lazyNamedComponent<Record<string, never>>(
 const CodingAgentTasksPanel = lazyNamedComponent<CodingAgentTasksPanelProps>(
   async () => (await importAppTaskCoordinator()).CodingAgentTasksPanel,
 );
-const FineTuningView = lazyNamedComponent<FineTuningViewProps>(
-  async () => (await importAppTraining()).FineTuningView,
-);
-
 const BRANDED_WINDOW_KEYS = {
   apiBase: `__${APP_ENV_PREFIX}_API_BASE__`,
   shareQueue: `__${APP_ENV_PREFIX}_SHARE_QUEUE__`,
@@ -437,39 +428,101 @@ function getWindowUrlSearchParams(): URLSearchParams {
 
 function applyCloudPairSessionToken(): void {
   if (typeof window === "undefined") return;
+  // Gate 0 — trusted shell. The durable pair credential is adopted only by
+  // the real app shell; an embedded third-party surface (Telegram Mini App /
+  // Discord Activity iframe, #9947) must not read, migrate, or stamp it —
+  // those surfaces get a scoped session from the embed handshake instead.
+  if (isEmbedPath(window.location.pathname)) return;
+  // Gate 1 — resolve the intended target base BEFORE touching storage. The
+  // durable pair credential is only ever adopted toward a dedicated cloud
+  // agent base; a control-plane, shared-adapter, local, or arbitrary origin
+  // must never read, migrate, or stamp it (#16666). Resolving the base first
+  // means a stale token on a non-dedicated origin is simply never adopted
+  // and never mirrored into the active-server/profile stores.
+  const apiBase = isDedicatedCloudAgentBase(window.location.origin)
+    ? window.location.origin
+    : getBootConfig().apiBase?.trim();
+  if (!isDedicatedCloudAgentBase(apiBase)) return;
+  // Gate 2 — the target must resolve to a dedicated agent id. A base that
+  // passes the suffix check but carries no agent label must not adopt the
+  // credential either; an unscoped adopter is the exact unscoped re-adoption
+  // path #16666 is closing.
+  const agentId = dedicatedCloudAgentIdFromBase(apiBase);
+  if (!agentId) return;
+  // Gate 3 — owner-bound read. The durable credential is stored under a
+  // per-agent key (`eliza:cloud-pair:api-token:<agentId>`), so this boot only
+  // ever reads the key belonging to the agent it resolved. A token persisted
+  // for agent A is invisible to a boot targeting agent B — it can never be
+  // adopted or mirrored across agents (#17579).
+  const agentTokenKey = cloudPairTokenKeyForAgent(agentId);
   let token: string | null = null;
   try {
-    token =
-      window.localStorage.getItem(CLOUD_PAIR_SESSION_TOKEN_KEY)?.trim() || null;
+    token = window.localStorage.getItem(agentTokenKey)?.trim() || null;
   } catch {
     // error-policy:J4 localStorage can be unavailable in hardened browser
     // contexts — sessionStorage remains the compatibility handoff.
   }
   if (!token) {
     try {
-      token =
-        window.sessionStorage.getItem(CLOUD_PAIR_SESSION_TOKEN_KEY)?.trim() ||
-        null;
+      token = window.sessionStorage.getItem(agentTokenKey)?.trim() || null;
     } catch {
       // error-policy:J4 sessionStorage can be unavailable in hardened browser
       // contexts — the pairing token is simply not adopted.
     }
     if (token) {
       try {
-        shellLocalStorage.setItem(CLOUD_PAIR_SESSION_TOKEN_KEY, token);
+        shellLocalStorage.setItem(agentTokenKey, token);
       } catch {
         // error-policy:J4 migration is best-effort; the same-tab token still
         // authenticates this launch.
       }
     }
   }
+  // Gate 4 — legacy single-key migration with target equality. A pre-#17579
+  // install stored the bearer under the global `eliza:cloud-pair:api-token`
+  // key with no owner binding. That key is adopted ONLY when the persisted
+  // active server for THIS agent still carries the identical bearer — i.e.
+  // the local record proves the legacy credential belongs to the agent being
+  // booted. Without that proof the legacy key is left untouched (never
+  // mirrored onto an agent that cannot claim it) and the pairing flow writes
+  // the scoped key on the next explicit pair.
+  if (!token) {
+    let legacyToken: string | null = null;
+    try {
+      legacyToken =
+        window.localStorage.getItem(CLOUD_PAIR_SESSION_TOKEN_KEY)?.trim() ||
+        null;
+    } catch {
+      // error-policy:J4 unreadable legacy storage — no adoption.
+    }
+    if (legacyToken) {
+      try {
+        const activeServer = loadPersistedActiveServer();
+        const ownedByTarget =
+          activeServer !== null &&
+          resolveDedicatedAgentId(activeServer) === agentId &&
+          activeServer.accessToken === legacyToken;
+        if (ownedByTarget) {
+          token = legacyToken;
+          try {
+            shellLocalStorage.setItem(agentTokenKey, token);
+          } catch {
+            // error-policy:J4 best-effort migration write.
+          }
+          try {
+            shellLocalStorage.removeItem(CLOUD_PAIR_SESSION_TOKEN_KEY);
+          } catch {
+            // error-policy:J3 best-effort legacy cleanup.
+          }
+        }
+      } catch {
+        // error-policy:J4 unreadable active-server record — legacy key stays
+        // unadopted rather than being stamped onto an unproven target.
+      }
+    }
+  }
   if (!token) return;
   client.setToken(token);
-  const apiBase = isDedicatedCloudAgentBase(window.location.origin)
-    ? window.location.origin
-    : getBootConfig().apiBase?.trim();
-  if (!isDedicatedCloudAgentBase(apiBase)) return;
-  const agentId = dedicatedCloudAgentIdFromBase(apiBase);
   const activeServer = createPersistedActiveServer({
     kind: "cloud",
     ...(agentId ? { id: `cloud:${agentId}` } : {}),
@@ -619,7 +672,7 @@ function installRendererServiceHost(): void {
   // host is what starts eligible services in THIS window's shell and retains
   // their disposers for pagehide/replacement teardown. Scope resolution reuses
   // the exact boot inputs the shell branches on, so a popout/detached/
-  // companion/app-window/model-tester/embed renderer never runs main-scoped
+  // companion/app-window/embed renderer never runs main-scoped
   // background services like LifeOps activity capture.
   startRendererServiceHost({
     shell: resolveRendererShellKind({
@@ -627,7 +680,6 @@ function installRendererServiceHost(): void {
       isPopout: isPopoutWindow(),
       isPhoneCompanion: isPhoneCompanionMode(),
       appWindowSlug: resolveAppWindowSlug(),
-      isModelTesterRoute: shouldLoadModelTesterShellRoute(),
       isEmbedRoute: isEmbedPath(window.location.pathname),
     }),
     reportError: (serviceId, error, phase) => {
@@ -670,7 +722,6 @@ function buildAppBootConfig(): AppBootConfig {
     codingAgentTasksPanel: CodingAgentTasksPanel,
     codingAgentSettingsSection: CodingAgentSettingsSection,
     codingAgentControlChip: CodingAgentControlChip,
-    fineTuningView: FineTuningView,
     characterCatalog: APP_CHARACTER_CATALOG,
     envAliases: APP_ENV_ALIASES,
     appBlockerSettingsCard: AppBlockerSettingsCard,
@@ -704,7 +755,6 @@ const BOOT_CONFIG_DEFERRED_MODULE_LOADERS: readonly SideEffectAppModuleLoader[] 
       load: importAppTaskCoordinatorRegister,
     },
     { key: "@elizaos/plugin-phone", load: importAppPhone },
-    { key: "@elizaos/plugin-training", load: importAppTraining },
   ];
 
 function initializeAppModules(): Promise<void> {
@@ -2356,11 +2406,6 @@ function resolveAppWindowSlug(): string | null {
   return slug.length > 0 ? slug : null;
 }
 
-function shouldLoadModelTesterShellRoute(): boolean {
-  const path = getWindowNavigationPath().replace(/[?#].*$/, "");
-  return path === "/model-tester";
-}
-
 /**
  * Top-level cloud/public/auth router shell. Web build only — lazy so the chunk
  * (and its react-router / Steward / cloud-provider transitive deps) never lands
@@ -2374,20 +2419,14 @@ const CloudRouterShell = lazy(async () => {
   }
   // Populate the cloud-route + settings-section registries before the shell
   // mounts and reads `listCloudRoutes()`; without this the registry is empty and
-  // no cloud/auth/payment route resolves. Cloud product surfaces come from two
-  // sources that register into the SAME process-global registries: the trunk
-  // `@elizaos/ui` cloud modules and the standalone `@elizaos/cloud-ui` package
-  // (arch #12092 item 23 — the cloud UI's own home). Both imports live inside
-  // this `__ELIZA_WEB_SHELL__`-guarded factory, so a cloud-free build drops
-  // them statically with no stub alias.
-  const [{ registerAllCloudSurfaces }, { registerCloudUiSurfaces }, mod] =
-    await Promise.all([
-      import("@elizaos/ui/cloud/register-all"),
-      import("@elizaos/cloud-ui"),
-      import("@elizaos/ui/cloud/shell/CloudRouterShell"),
-    ]);
+  // no cloud/auth/payment route resolves. Both imports live inside this
+  // `__ELIZA_WEB_SHELL__`-guarded factory, so a cloud-free build drops them
+  // statically.
+  const [{ registerAllCloudSurfaces }, mod] = await Promise.all([
+    import("@elizaos/ui/cloud/register-all"),
+    import("@elizaos/ui/cloud/shell/CloudRouterShell"),
+  ]);
   registerAllCloudSurfaces();
-  registerCloudUiSurfaces();
   return { default: mod.CloudRouterShell };
 });
 
@@ -3131,30 +3170,6 @@ async function main(): Promise<void> {
     })
   ) {
     return;
-  }
-
-  const appWindowSlug = window.location.pathname.startsWith("/apps/")
-    ? window.location.pathname.slice("/apps/".length).split("/")[0]
-    : resolveAppWindowSlug();
-  if (appWindowSlug === "model-tester") {
-    await importSideEffectAppModule(
-      "@elizaos/app-model-tester",
-      () => import("@elizaos/app-model-tester"),
-    );
-    setupPlatformStyles();
-    // This early-return path never schedules the deferred side-effect loads,
-    // but the service host still needs to exist so any model-tester-scoped
-    // renderer service can run — and main-scoped ones observably cannot.
-    installRendererServiceHost();
-    mountReactApp();
-    return;
-  }
-
-  if (shouldLoadModelTesterShellRoute()) {
-    await importSideEffectAppModule(
-      "@elizaos/app-model-tester",
-      () => import("@elizaos/app-model-tester"),
-    );
   }
 
   markStartup("app-modules:start");
