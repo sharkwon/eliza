@@ -165,13 +165,30 @@ export class TurnControllerRegistry {
 		// (live 2026-08-19: "cancel all ur running coding tasks" → errored
 		// turn, nothing delivered).
 		const self = getCurrentTurnStorage()?.getStore();
+		const turns = this.active.get(roomId) ?? [];
+		if (turns.length === 0) return false;
+
 		let aborted = false;
-		for (const turn of this.active.get(roomId) ?? []) {
-			if (turn === self) continue;
-			if (turn.controller.signal.aborted) continue;
-			turn.reason = reason;
-			turn.controller.abort(new TurnAbortedError(reason));
-			aborted = true;
+		if (self) {
+			// In-band caller: abort all OTHER turns (existing behavior).
+			for (const turn of turns) {
+				if (turn === self) continue;
+				if (turn.controller.signal.aborted) continue;
+				turn.reason = reason;
+				turn.controller.abort(new TurnAbortedError(reason));
+				aborted = true;
+			}
+		} else {
+			// Out-of-band caller (HTTP stop, test, lifecycle): abort ONLY the
+			// latest waiter (last in array), preserving the owner (first).
+			// Coalesced waiters are appended after the owner, so the last
+			// entry is always the most recent waiter.
+			const waiter = turns[turns.length - 1];
+			if (!waiter.controller.signal.aborted) {
+				waiter.reason = reason;
+				waiter.controller.abort(new TurnAbortedError(reason));
+				aborted = true;
+			}
 		}
 		if (aborted) this.emit({ type: "aborted", roomId, reason });
 		return aborted;

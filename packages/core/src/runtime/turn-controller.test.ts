@@ -54,27 +54,53 @@ describe("TurnControllerRegistry", () => {
 		expect(result).toEqual({ aborted: false, selfAborted: false });
 	});
 
-	it("an out-of-band abort kills every turn in the room", async () => {
+	it("an out-of-band abort kills only the latest waiter, preserving the owner", async () => {
 		const registry = new TurnControllerRegistry();
-		const started = [deferred(), deferred()];
-		const turns = started.map((gate, i) =>
+		const ownerDone = deferred();
+		const waiterStarted = deferred();
+		const turns = [
+			// Owner: completes normally (no await for abort)
 			registry.runWith("room-1", async (signal) => {
-				gate.resolve();
+				ownerDone.resolve();
+				return 0;
+			}),
+			// Waiter: waits for abort
+			registry.runWith("room-1", async (signal) => {
+				waiterStarted.resolve();
 				await new Promise<void>((_, reject) => {
 					signal.addEventListener("abort", () => reject(signal.reason), {
 						once: true,
 					});
 				});
-				return i;
+				return 1;
 			}),
-		);
-		const outcomes = turns.map((turn) =>
-			expect(turn).rejects.toBeInstanceOf(TurnAbortedError),
-		);
-		await Promise.all(started.map((g) => g.promise));
+		];
+		// Wait for owner to complete, waiter to start
+		await Promise.all([ownerDone.promise, waiterStarted.promise]);
 
+		// Out-of-band abort (e.g., HTTP stop route, test) targets ONLY the
+		// most recent waiter (last in array), preserving the owner (first).
 		expect(registry.abortTurn("room-1", "http-stop")).toBe(true);
-		await Promise.all(outcomes);
+
+		// First turn (owner) should complete normally
+		const [ownerResult, waiterResult] = await Promise.allSettled(turns);
+		if (ownerResult.status === "fulfilled") {
+			expect(ownerResult.value).toBe(0);
+		} else {
+			throw new Error("Owner should not be aborted");
+		}
+
+		// Second turn (waiter) should be aborted
+		if (waiterResult.status === "rejected") {
+			expect(waiterResult.reason).toBeInstanceOf(TurnAbortedError);
+			expect((waiterResult.reason as TurnAbortedError).reason).toBe(
+				"http-stop",
+			);
+		} else {
+			throw new Error("Waiter should be aborted");
+		}
+
+		// Owner already completed, no active turns after owner done
 		expect(registry.hasActiveTurn("room-1")).toBe(false);
 	});
 });
